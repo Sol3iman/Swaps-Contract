@@ -1,0 +1,455 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.4.0 <0.9.0;
+
+import  'openzeppelin-solidity/contracts/ownership/Ownable.sol';
+import  'openzeppelin-solidity/contracts/math/SafeMath.sol';
+
+
+contract interestRateSwap is Ownable{
+    using SafeMath for uint256;
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- EVENTS ----------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+    event Deposited(
+        address indexed account, 
+        uint256 amount, 
+        uint256 timestamp
+        );
+
+    event Liquidation(
+        address indexed account,
+        address indexed liquidator,
+        uint marginLiquidated,
+        uint liquidationFee
+    );
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- STATE VARIABLES -------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+    string public fixedRate = 'fixed';
+    string public variableRate = 'variable';
+    address public proposalOwner; //proposal owner address
+    address public counterparty; // counterparty owner address
+    uint public liquidationFeeThresholdPercentage; // should I set this here already? 7%
+    uint public liquidationFeePercentage;  // should I set this here already? 4% according to Aave v2 USDC lending pool
+
+    // Storing these two as state variables for access in the payout functions. 
+    uint public timeStampStart = block.timestamp; // When the contract started
+    uint public contract_duration = proposal_owner.contractEndUnixTimestamp.sub(timeStampStart); // How long the contract is for local variable
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- STRUCTURES ------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+struct IRS_Terms {
+    uint totalMarginAmount; // Margin set at 10% of notional amount.
+    uint fixedInterestRate; //expressed in 7 decimal points converted to integer--i.e. 0.0239539 or 2.39539% x10000000 is 239539
+    uint contractStartUnixTimestamp;
+    uint contractEndUnixTimestamp; //month, day, year or # of months from start timestamp
+    uint contractDuration; // would be a precise date but this can be ironed out later.     
+    
+    //Liquidation terms 
+    uint liquidationThreshold; // a percentage
+    uint liquidationFee; // should be a percentage (4%) of the Liquidated amount i.e. the collateral. Liquidation is triggered at 7% of...
+                            // ...Notional so therefore liquidationFee= 0.01 * remaining margin
+
+}
+struct ProposalOwner {
+    uint notionalAmount;  //this amount is used to calculate the margin amount
+    uint proposerInterestRate; //current interest rate of proposal owner (could be variable could be fixed) determined 2 lines down. 
+    uint contractEndUnixTimestamp; //month, day, year or # of months from start timestamp. Maturity date of the terms
+    string proposerInterestRateType; //fixed or variable. If fixed, then proposal owner is fixed_to_var_owner, vice versa.
+    }
+
+
+// COULD HAVE INLCUDED THE BELOW INFO THE IN THE ABOVE STRUCT, CAN FIX LATER. 
+struct ProposalMargin {
+        uint marginDepositTimestamp;
+        uint marginAmountDeposited; //expressed in wei/ether
+    }
+struct CounterpartyMargin {
+        uint marginDepositTimestamp;
+        uint marginAmountDeposited; //NOT SURE WHETHER I NEED TO DECLARE THIS TWICE SINCE IT WAS DECLARED IN Proposal
+    }
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- MAPPINGS --------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+// Create empty mappings which you will later populate with relationships. 
+mapping (address => IRS_Terms) public contractAddressToContractTerms; //this uses the address of the contract to get the contract terms
+mapping (address => ProposalOwner) public proposalAddressToProposalOwner; //this uses the address of the proposer to get their information
+mapping (address => ProposalMargin) public proposalAddressToProposalMargin; //this uses the address of the proposer to get info on how much margin they deposited.
+mapping (address => CounterpartyMargin) public counterpartyAddressToCounterpartyAddressMargin; //this uses the address of the counterparty to get info on how much margin they deposited.
+mapping (address => uint256) public payeeAddressToPayAmount; // this uses the proposer or counterparty address to get the amount they need to pay.
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- MODIFIERS -------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+modifier onlyProposalOwner() {
+    require(msg.sender == proposalOwner, "Only the contract terms propasal owner can call this function.");
+    _;
+}
+
+modifier onlyCounterparty() {
+    require(msg.sender == counterparty, "Only the contract terms conterparty can call this function.");
+    _;
+}
+
+modifier hasMatured(){
+    IntSwapTerms memory int_swap_terms = contractAddressToContractTerms[address(this)]; //address(this) is the address of this contract
+
+    require (block.timestamp >= int_swap_terms.contractEndUnixTimestamp, "Contract has NOT YET matured.");
+    _;
+}
+
+modifier isLiquidated(){
+    require (block.timestamp < int_swap_terms.contractEndUnixTimestamp, "Liquidate contract BEFORE maturity date.");
+    _;
+}
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------- FUNCTIONS -------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+function registerProposalOwner(address _proposal_owner, uint _notionalAmount, uint _proposerInterestRate, uint _maturity, string _proposerInterestRateType) public {
+        // This ensures the proposer who wants to initiate a contract is not broke.
+        require(proposalAddressToProposalOwner[proposalOwner].notionalAmount != 0, "Notional amount is ZERO. Go take out a loan!"); // returns true if the notionalAmount is non zero 
+        
+        // This ensures the proposer of the contract is the only person who can set the variables. 
+        require( _proposal_owner == msg.sender);
+        
+        // Why we use memory here https://stackoverflow.com/questions/33839154/in-ethereum-solidity-what-is-the-purpose-of-the-memory-keyword
+        // This assigns the values of the notional, interest rate, maturity, and interest rate type to the ProposalOwner structure 
+        ProposalOwner memory proposal_owner = ProposalOwner({notionalAmount: _notionalAmount, 
+                                                            proposerInterestRate: _proposerInterestRate, 
+                                                            contractEndUnixTimestamp: _maturity, 
+                                                            proposerInterestRateType: _proposerInterestRateType});
+
+        proposalOwner = _proposal_owner;
+
+        //map the proposal owner address to proposal owner struct
+        proposalAddressToProposalOwner[_proposal_owner] = proposal_owner;
+    }
+
+function registerCounterparty(address _counterparty) public {
+        // the address(0) ensures that the proposalOwner address is not 0x00000000000000000000 i.e. it ensures it is a registered address. 
+        // source: https://ethereum.stackexchange.com/questions/42717/what-does-address0-mean/42718
+        require (proposalOwner != address(0), "Counterparty cannot register before the proposal owner has. The proposal has not even been made, yet!");
+        
+        // Checks the variables of type address counterparty does not have an assigned address. It compares against 0x00000000000000000000 and if it matches returns TRUE   
+        require(counterparty == address(0));
+        require(_counterparty == msg.sender);
+
+        // Assign the _counterparty variable of type address to the counterparty variable address
+        counterparty = _counterparty;
+    }
+
+ function calculateMarginAmount (uint _marginPercentage) internal returns (uint) {
+        // We assume proposer and counterparty each pay 10% of the notionalAmount as margin 
+        // Can enter any percentage you like now and it will be saved in _marginPercentage
+
+        ProposalOwner memory proposal_owner = proposalAddressToProposalOwner[proposalOwner];
+        uint marginAmount = proposal_owner.notionalAmount.mul(_marginPercentage);
+        return marginAmount;
+ }
+
+function proposerDepositMargin (uint _marginAmount, uint _marginPercentage) public payable onlyProposalOwner {
+        require(msg.value == _marginAmount); //msg.value(in wei or ether) has to be the same as the margin amount
+        require(_marginAmount == calculateMarginAmount(_marginPercent)); //the amount deposited by the proposer must match the calculated Margin Amount
+        // Make sure the proposer hasn't already deposited a margin by verifying their deposited marginAmount is 0.
+        require(proposalAddressToProposalMargin[proposalOwner].marginAmountDeposited == 0);
+
+        // Assign the variable proposalMargin into memory and cast it to type ProposalMargin (struct) which assigns 
+        // a time stamp on the deposit and the amount of margin as calculated through the dedicated function calculate MarginAmount. 
+        ProposalMargin memory proposalMargin = ProposalMargin( {marginDepositTimestamp: block.timestamp, 
+                                                                 marginAmountDeposited: _marginAmount} );
+
+        // Assign the proposalMargin struct to the address of the proposal Owner. 
+        proposalAddressToProposalMargin[proposalOwner] = proposalMargin;
+        // Emit an event to tell the network the proposer has deposited a margin, how much and what time. 
+        // CREATE THE EVENT FOR THIS UPSTREAM IN THE CODE
+        emit Deposited(proposalOwner, _marginAmount, block.timestamp);
+    }
+
+    function counterpartyDepositMargin (uint _marginAmount, uint _marginPercent) public payable onlyCounterparty {
+        require(msg.value == _marginAmount);
+        require(_marginAmount == calculateMarginAmount(_marginPercentage)); //require the proposal owner to send the same amount of calculated margin
+        require(counterpartyAddressToCounterpartyAddressmargin[counterparty].marginAmountDeposited == 0);
+
+        CounterpartyMargin memory counterparty_margin = CounterpartyMargin({marginDepositTimestamp: block.timestamp, 
+                                                                            marginAmountDeposited: _marginAmount} );
+        counterpartyAddressToCounterpartyAddressmargin[counterparty] = counterparty_margin;
+
+        emit Deposited(counterparty, _marginAmount, block.timestamp);
+    }
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------- FUNCTION "1" INITIATE THE IRS SWAP CONTRACTS --------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+function initiateInterestRateSwap (uint _fixedInterestRate) onlyOwner public {
+
+        ProposalOwner memory proposal_owner = proposalAddressToProposalOwner[proposalOwner]; //this gives us the proposal owner struct
+        ProposalMargin memory proposal_margin = proposalAddressToProposalMargin[proposalOwner]; //This gives us the proposal margin struct
+        CounterpartyMargin memory counterparty_margin = counterpartyAddressToCounterpartyAddressMargin[counterparty]; //This gives us the counterparty struct
+
+        require (proposal_margin.marginAmountDeposited != 0); //making sure proposal owner has deposited the money
+        require (counterparty_margin.marginAmountDeposited != 0);
+        require (proposal_margin.marginAmountDeposited == counterparty_margin.marginAmountDeposited);
+        require (_fixedInterestRate > 0);
+        require (proposalOwner != 0);
+        require (counterparty != 0);
+
+        uint totalMarginAmount = proposal_margin.marginAmountDeposited.add(counterparty_margin.marginAmount_deposited);
+        uint timeStampStart = block.timestamp; // When the contract started
+        uint contract_duration = proposal_owner.contractEndUnixTimestamp.sub(timeStampStart); // How long the contract is for local variable
+
+        IRS_Terms memory intswap_terms = IRS_Terms({totalMarginAmount: totalMarginAmount,
+                                                     fixedInterestRate: _fixedInterestRate, 
+                                                     contractStartUnixTimestamp: timeStampStart, 
+                                                     contractEndUnixTimestamp: proposal_owner.contractEndUnixTimestamp}; 
+                                                     contractactDuration: contract_duration);
+                                                     
+
+
+        // Enter the contract terms into the mapping for the contract address to the contract terms using address(this) to get the 
+        // contract address.
+        contractAddressToContractTerms[address(this)] = intswap_terms; 
+    }
+
+ 
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------- FUNCTION "2" CALCULATE THE PAYOUTS -----------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+// --------NOW CALCULATE HOW MUCH EACH PARTY WOULD GET IF THE CONTRACTS REACH MATURITY------- 
+// hasMatured modifier ensures function is only called when the contracts have matured. 
+// use oracle to find out the yield for Aave v2 USDC and enter here only when matured. 
+// TO DO BUILD IN A FUNCTION FOR ORACLE 
+function VariableToFixedPayoutCalculator(uint _end_Aave_USDC) public hasMatured onlyOwner returns (uint VariableToFixedPayout){
+       
+
+        ProposalOwner memory proposal_owner = proposalAddressToProposalOwner[proposalOwner];
+        IRS_Terms memory int_swap_terms = contractAddressToContractTerms[address(this)]; //address(this) is the address of this contract
+
+        //Initialise with 0 not needed as default value of uint is 0. 
+        uint VarToFixedProfit;
+        uint VarToFixedLoss;
+
+        uint end_Aave_USDC = _end_Aave_USDC;
+        uint _fixedInterestRate = int_swap_terms.fixedInterestRate; // Extract the fixed interest rate of the proposer from the agreed upon terms 
+        uint _notionalAmount = proposal_owner.notionalAmount; // Extract the notionalAmount of the proposer 
+        uint _marginAmount;
+
+        // declare a varToFixedOwner address i.e. if the owner has a variable rate and wants to buy a fixed rate this applies. 
+        address varToFixedOwner; 
+
+
+        // Interest rate type is a string, check if the proposal owner's interest rate type is variable or fixed (they specify this when they register)
+        if (keccak256(proposal_owner.proposerInterestRateType) == keccak256(variableRate)) {
+            // Extract the margin deposit of the proposal owner and assing to _marginAmount
+            _marginAmount = proposalAddressToProposalMargin[proposalOwner].marginAmountDeposited;
+            // Assign the proposal owner address to the variable varToFixedOwner as this specifies the type of the buyer they are. 
+            // i.e., they are a fixed rate buyer. 
+            varToFixedOwner = proposalOwner;
+        } else {
+            _marginAmount = counterpartyAddressToCounterpartyAddressMargin[counterparty].marginAmountDeposited;
+            varToFixedOwner = counterparty;
+        }
+
+        // At maturity 
+        // when end_Aave_USDC goes up at maturity then the proposal owner's bet that interest rates would go up came true, they paid less by choosing
+        // a fixed interest rate contract and therefore they made a profit on the difference. 
+        if (end_Aave_USDC > _fixedInterestRate){
+            //profit = (var rate- fixed rate)* notional * duration/year
+            VarToFixedProfit = (_notionalAmount.mul(end_Aave_USDC.sub(_fixedInterestRate))).mul(contractDuration.div(365))
+        }
+        // At maturity 
+        // when end_Aave_USDC variable yield goes down then the proposal owner's bet that interest rates would go up did not come true,
+        // they paid more by choosing a fixed interest rate contract and therefore they made a loss on the difference. 
+        if (end_Aave_USDC <= _fixedInterestRate){
+            VarToFixedLoss = (_notionalAmount.mul(_fixedInterestRate.sub(end_Aave_USDC) )  ).mul(contractDuration.div(365))
+        }
+
+        //VarToFixedProfit is limited by the _marginAmount
+        // if the VarToFixedProfit is greater than the _marginAmount
+        // gain cannot exceed the other party's margin
+        if (VarToFixedProfit > _marginAmount){
+            VarToFixedProfit = _marginAmount;
+        }
+        //if the VarToFixedLoss is greater than the _marginAmount
+        //loss cannot exceed your own margin 
+        if (VarToFixedLoss > _marginAmount){
+            VarToFixedLoss = _marginAmount;
+        }
+
+        VariableToFixedPayout = _marginAmount + VarToFixedProfit - VarToFixedLoss;
+
+        payeeAddressToPayAmount[varToFixedOwner] = VariableToFixedPayout;
+
+        return VariableToFixedPayout;
+    }
+
+
+
+
+// uint256 only handles non-negative numbers so I have to write both situations explicitly i.e. 
+// notional(var-fixed) and notional(fixed-var)
+
+// Not sure how to efficiently store the variable rate Aave_USDC every month to calculate monthly payments 
+// The below is only for the final payment of the contract assuming there is a single annuity at the end. 
+function FixedToVariablePayoutCalculator(uint _end_Aave_USDC) public hasMatured onlyOwner returns(uint FixedToVariablePayout){
+        //if aave-usdc yield increases (is positive) FixedToVar owner gets a loss
+        //if aave-usdc yield decreases (is negative) FixedToVar owner gets a profit
+        ProposalOwner memory proposal_owner = proposalAddressToProposalOwner[proposalOwner];
+        IRS_Terms memory int_swap_terms = contractAddressToContractTerms[address(this)]; //address(this) is the address of this contract
+
+        uint FixedToVarProfit;
+        uint FixedToVarLoss;
+        
+        uint end_Aave_USDC = _end_Aave_USDC;
+        uint _fixedInterestRate = int_swap_terms.fixedInterestRate;
+        uint _notionalAmount = proposal_owner.notionalAmount;
+        uint _marginAmount;
+        address fixedToVarOwner;
+
+        
+
+        if (keccak256(proposal_owner.proposerInterestRateType) == keccak256(fixedRate)) {
+            _marginAmount = proposalAddressToProposalMargin[proposalOwner].marginAmountDeposited;
+            fixedToVarOwner = proposalOwner;
+        } else {
+            _marginAmount = counterpartyAddressToCounterpartyAddressMargin[counterparty].marginAmountDeposited;
+            fixedToVarOwner = counterparty;
+        }
+
+        if (end_Aave_USDC < _fixedInterestRate){
+            FixedToVarProfit = (_notionalAmount.mul(_fixedInterestRate.sub(end_Aave_USDC))).mul(contractDuration.div(365))
+        }
+        if (end_Aave_USDC >= _fixedInterestRate){
+            FixedToVarLoss = (_notionalAmount.mul(end_Aave_USDC.sub(_fixedInterestRate))).mul(contractDuration.div(365))
+        }
+        if (FixedToVarProfit > _marginAmount){
+            FixedToVarProfit = _marginAmount;  
+        }
+        if (FixedToVarLoss > _marginAmount){
+            FixedToVarLoss = _marginAmount;  
+        }
+        FixedToVariablePayout = _marginAmount + FixedToVarProfit - FixedToVarLoss;
+
+        payeeAddressToPayAmount[fixedToVarOwner] = FixedToVariablePayout;
+
+        return FixedToVariablePayout;
+    }
+
+
+
+
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// -------------------------------------------- FUNCTION "3" LIQUIDATE THE CONTRACT  ---------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+function calcInterest(address _account) public view returns (uint256 interest) {
+
+        uint256 secondsSinceLastInterest_ = 
+        int128 yearsBorrowed = 
+        int128 interestRate = 
+
+        return uint256 interest; 
+    }
+
+
+
+function liquidation (address _account, uint _marginPercentage) isLiquidated public {
+    
+    if (_account == proposalOwner) {
+        liquideePosition memory pos  =  proposalAddressToProposalMargin[proposalOwner]
+    } else {
+        liquideePosition memory pos  =  counterpartyAddressToCounterpartyAddressMargin[counterparty]
+    }
+
+    require(pos.marginAmountDeposited > 0, "Account has no collateral");
+
+    // How do I continuously recalculate the interest rate? 
+    uint256 interest = calcInterest(_account);
+    uint256 collateral = calculateMarginAmount(_marginPercentage) // fix this 
+
+    require( margin >= (liquidationThreshold.mul(notional)), "Account is not below the liquidation threshold" );
+
+    liquidation_fee  = liquidationFeePercentage.mul(marginAmount);
+
+    
+    //Liquidated account pays the fees to the counterparty.
+    // No way of receiving the fees by either party yet because I haven't written variables for their structs. 
+    
+    //Liquidated account pays the amount of interest owed from their margin pot to the counterparty
+
+    emit Liquidation(
+            _account,
+            msg.sender, // the contract is the liquidator technically
+            marginAmount, // Amount of margin that was liquidated.
+            liquidation_fee // Fee for the liquidation. 
+        );
+}
+
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------- EXTENSION TASK -----------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------------------------------------------
+
+/**  -------- NOW WRITE A FUNCTION WHICH PREVENTS EITHER PARTY FROM BEING LIQUIDATED ---------------------------------------------------
+    1. Write function which checks (every month? continuously?) if you are within a margin of being liquidated e.g. within 1% of being 
+        at the liquidation threshold of 7% so 8% of being liquidated. 
+    2. If it is within that range, calculate the payout of the parties up until that point using a function similar to the ones used
+        to calculate payouts at maturity.
+    3. Return the notional amount of each party and their gains 
+
+*/
+
+
+}
+
+/**TODOs
+1. Ensure all maths operations are done using safeMath e.g. .mul() .add() etc.
+*/
+
+
+/** 
+Function 1 -- initiate an interest rate swap contract between 2 wallet addresses 
+Inputs: Notional principle; duration of the contract
+Definition: notional principle -- the amount which is borrowed against the interest rate. 
+constant fixed rate for the IRS i.e. FIXED Aave_USDC RATE (SIMPLICITY)
+*****peer-to-peer basis contract -- nothing needs to be done for this one*****
+both sides of the IRS contract deposit 10% of the notional as margin
+*/ 
+
+
+
+/**  Function 2 --  settle an IRS contract at maturity
+// Both variable and fixed taker need to settle the correct IRS cashflow at the maturity of the IRS contract.
+// Assume the IRS contracts are initiated on top of the variable yield Aave v2 USDC lending pool i.e. 3.39%.
+ source: https://app.aave.com/#/reserve-overview/0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb480xb53c1a33016b2dc2ff3653530bff1848a515c8c5
+*/
+
+/**  Function 3 -- Function which liquidates an ongoing IRS contract if either party's margin is below the liquidation threshold
+// Liquidation threshold = 7% of Notional
+// Liquidation Event should trigger early settlement of the IRS contract
+// Liquidation Event should trigger a penalty that must be paid by the party who was liquidated
+// Penalty goes to the counterparty of the contract.
+*/
+
+
+
